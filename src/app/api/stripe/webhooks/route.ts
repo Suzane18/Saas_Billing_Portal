@@ -11,12 +11,24 @@ if (!STRIPE_SECRET_KEY) {
 
 const stripe = new Stripe(STRIPE_SECRET_KEY)
 
-const createDate = (timestamp: number | null): Date | null =>
-  timestamp ? new Date(timestamp * 1000) : null
+const getLatestStripeSubscription = async (subscriptionOrId: Stripe.Subscription | string) => {
+  const subscriptionId = typeof subscriptionOrId === 'string' ? subscriptionOrId : subscriptionOrId.id
+  if (!subscriptionId) {
+    throw new Error('Stripe subscription ID is required')
+  }
 
-const upsertSubscriptionFromStripeSubscription = async (subscription: Stripe.Subscription) => {
+  const latestSubscription = await stripe.subscriptions.retrieve(subscriptionId)
+  if (!latestSubscription) {
+    throw new Error('Stripe subscription could not be retrieved from Stripe API')
+  }
+
+  return latestSubscription
+}
+
+const upsertSubscriptionFromStripeSubscription = async (subscriptionOrId: Stripe.Subscription | string) => {
+  const subscription = await getLatestStripeSubscription(subscriptionOrId)
+
   console.log('[WEBHOOK RECEIVED] Processing subscription upsert', { stripeSubscriptionId: subscription.id })
-
   console.log('[SUBSCRIPTION UPSERT START]', { stripeSubscriptionId: subscription.id })
 
   // Prefer explicit userId passed via Stripe metadata
@@ -40,18 +52,86 @@ const upsertSubscriptionFromStripeSubscription = async (subscription: Stripe.Sub
     throw new Error('Stripe subscription metadata missing userId and no matching user by customer id')
   }
 
-  const priceId = (subscription.items?.data?.[0]?.price as Stripe.Price | string)
-  const stripePriceId = typeof priceId === 'string' ? priceId : priceId?.id
+  const price = subscription.items?.data?.[0]?.price as Stripe.Price | string
+  const stripePriceId = typeof price === 'string' ? price : price?.id
   if (!stripePriceId) {
     throw new Error('Stripe subscription missing price id')
   }
 
-  const stripeSubscription = subscription as Stripe.Subscription & { current_period_start: number | null; current_period_end: number | null }
-  const currentPeriodStart = stripeSubscription.current_period_start ?? null
-  const currentPeriodEnd = stripeSubscription.current_period_end ?? null
+  const billingInterval = typeof price === 'object' ? price.recurring?.interval : undefined
+  const planType = typeof price === 'object' ? price.nickname ?? stripePriceId : stripePriceId
 
-  console.log('[CURRENT PERIOD START]', { currentPeriodStart })
-  console.log('[CURRENT PERIOD END]', { currentPeriodEnd })
+  console.log('[SUBSCRIPTION OBJECT]', JSON.stringify(subscription, null, 2))
+  console.log('[PRICE ID]', { stripePriceId })
+  console.log('[PLAN TYPE]', { planType })
+  console.log('[STATUS]', { status: subscription.status })
+
+  const stripeSubscription = subscription as unknown as Stripe.Subscription & {
+    current_period_start?: number | null
+    current_period_end?: number | null
+  }
+
+  const periodStart = stripeSubscription.current_period_start
+    ? new Date(stripeSubscription.current_period_start * 1000)
+    : null
+  const periodEnd = stripeSubscription.current_period_end
+    ? new Date(stripeSubscription.current_period_end * 1000)
+    : null
+
+  console.log('[STRIPE PERIOD START]', { periodStart: stripeSubscription.current_period_start })
+  console.log('[STRIPE PERIOD END]', { periodEnd: stripeSubscription.current_period_end })
+  console.log('[DATABASE PERIOD START]', { periodStart })
+  console.log('[DATABASE PERIOD END]', { periodEnd })
+
+  if (!stripeSubscription.current_period_start || !stripeSubscription.current_period_end) {
+    console.warn('[STRIPE PERIOD MISSING]', {
+      stripeSubscriptionId: subscription.id,
+      current_period_start: stripeSubscription.current_period_start,
+      current_period_end: stripeSubscription.current_period_end,
+    })
+  }
+
+  if (periodStart && periodEnd) {
+    if (periodEnd.getTime() <= periodStart.getTime()) {
+      console.error('[PERIOD VALIDATION FAILED]', {
+        stripeSubscriptionId: subscription.id,
+        currentPeriodStart: periodStart,
+        currentPeriodEnd: periodEnd,
+      })
+      throw new Error('Stripe subscription current_period_end must be after current_period_start')
+    }
+
+    if (billingInterval) {
+      const durationMs = periodEnd.getTime() - periodStart.getTime()
+      const oneMonthMs = 30 * 24 * 60 * 60 * 1000
+      const oneYearMs = 365 * 24 * 60 * 60 * 1000
+      const isMonthly = billingInterval === 'month'
+      const isYearly = billingInterval === 'year'
+      const approxMatch = isMonthly
+        ? Math.abs(durationMs - oneMonthMs) <= 3 * 24 * 60 * 60 * 1000
+        : isYearly
+        ? Math.abs(durationMs - oneYearMs) <= 7 * 24 * 60 * 60 * 1000
+        : true
+
+      console.log('[PERIOD VALIDATION]', {
+        currentPeriodStart: periodStart,
+        currentPeriodEnd: periodEnd,
+        billingInterval,
+        durationMs,
+        approxMatch,
+      })
+
+      if (!approxMatch) {
+        console.warn('[PERIOD VALIDATION FAILED]', {
+          stripeSubscriptionId: subscription.id,
+          billingInterval,
+          currentPeriodStart: periodStart,
+          currentPeriodEnd: periodEnd,
+          durationDays: Math.round(durationMs / (1000 * 60 * 60 * 24)),
+        })
+      }
+    }
+  }
 
   try {
     const result = await prisma.subscription.upsert({
@@ -59,21 +139,37 @@ const upsertSubscriptionFromStripeSubscription = async (subscription: Stripe.Sub
       create: {
         userId,
         stripeSubscriptionId: subscription.id,
-        stripePriceId: stripePriceId,
+        stripePriceId,
         status: subscription.status,
-        currentPeriodStart: createDate(currentPeriodStart),
-        currentPeriodEnd: createDate(currentPeriodEnd),
+        currentPeriodStart: periodStart,
+        currentPeriodEnd: periodEnd,
       },
       update: {
-        stripePriceId: stripePriceId,
+        stripePriceId,
         status: subscription.status,
-        currentPeriodStart: createDate(currentPeriodStart),
-        currentPeriodEnd: createDate(currentPeriodEnd),
+        currentPeriodStart: periodStart,
+        currentPeriodEnd: periodEnd,
       },
     })
 
-    // If this subscription is now active, mark any other subscriptions for the user as canceled
-    if (subscription.status === 'active') {
+    console.log('[DATABASE PERIOD START]', { databasePeriodStart: result.currentPeriodStart })
+    console.log('[DATABASE PERIOD END]', { databasePeriodEnd: result.currentPeriodEnd })
+
+    if (
+      result.currentPeriodStart?.getTime() !== periodStart?.getTime() ||
+      result.currentPeriodEnd?.getTime() !== periodEnd?.getTime()
+    ) {
+      console.warn('[SYNC MISMATCH DETECTED]', {
+        stripeSubscriptionId: subscription.id,
+        stripePeriodStart: periodStart,
+        stripePeriodEnd: periodEnd,
+        databasePeriodStart: result.currentPeriodStart,
+        databasePeriodEnd: result.currentPeriodEnd,
+      })
+    }
+
+    if (subscription.status !== 'canceled' && subscription.status !== 'incomplete_expired') {
+      console.log('[SUBSCRIPTION CLEANUP START]', { stripeSubscriptionId: subscription.id, userId, status: subscription.status })
       try {
         const cleanupResult = await prisma.subscription.updateMany({
           where: {
@@ -82,13 +178,16 @@ const upsertSubscriptionFromStripeSubscription = async (subscription: Stripe.Sub
           },
           data: { status: 'canceled' },
         })
-        console.log('[OLD SUBSCRIPTIONS CANCELED]', { stripeSubscriptionId: subscription.id, userId, count: cleanupResult.count })
+        console.log('[SUBSCRIPTION CLEANUP SUCCESS]', { stripeSubscriptionId: subscription.id, userId, canceledCount: cleanupResult.count })
+        if (cleanupResult.count > 0) {
+          console.log('[CANCELED SUBSCRIPTION]', { stripeSubscriptionId: subscription.id, userId, canceledCount: cleanupResult.count })
+        }
       } catch (err) {
         console.warn('[SUBSCRIPTION CLEANUP] failed to cancel other subscriptions', err)
       }
     }
 
-    console.log('[SUBSCRIPTION UPSERT SUCCESS]', { stripeSubscriptionId: subscription.id, userId, status: subscription.status })
+    console.log('[ACTIVE SUBSCRIPTION]', { stripeSubscriptionId: subscription.id, userId, status: subscription.status })
     return result
   } catch (error) {
     console.error('[SUBSCRIPTION UPSERT FAILED]', { stripeSubscriptionId: subscription.id, error: error instanceof Error ? error.message : String(error) })
@@ -107,21 +206,17 @@ const handleCheckoutSessionCompleted = async (session: Stripe.Checkout.Session) 
     throw new Error('Checkout session did not include a customer id')
   }
 
-  const subscription = await stripe.subscriptions.retrieve(subscriptionId)
-  if (!subscription) {
-    throw new Error('Stripe subscription could not be retrieved')
-  }
-
   console.log('[WEBHOOK RECEIVED] checkout.session.completed', { sessionId: session.id, subscriptionId, customerId })
 
-  // If the subscription object from Stripe doesn't contain metadata.userId, the upsert will fall back
-  return upsertSubscriptionFromStripeSubscription(subscription)
+  return upsertSubscriptionFromStripeSubscription(subscriptionId)
 }
 
 const handleSubscriptionDeleted = async (subscription: Stripe.Subscription) => {
   // Try to resolve userId from metadata or customer
-  const userId = subscription.metadata?.userId ?? (typeof subscription.customer === 'string' ? subscription.customer : (subscription.customer as any)?.id)
-  console.log('[WEBHOOK RECEIVED] customer.subscription.deleted', { stripeSubscriptionId: subscription.id, userIdFromMetadata: subscription.metadata?.userId })
+  const customer = subscription.customer
+  const customerId = typeof customer === 'string' ? customer : customer?.id
+  const userId = subscription.metadata?.userId ?? customerId
+  console.log('[WEBHOOK RECEIVED] customer.subscription.deleted', { stripeSubscriptionId: subscription.id, userId, userIdFromMetadata: subscription.metadata?.userId })
 
   try {
     // Prefer updating status to keep history rather than deleting records
@@ -171,7 +266,7 @@ export async function POST(request: Request) {
         break
       }
       case 'invoice.paid': {
-        const invoice = event.data.object as any
+        const invoice = event.data.object as Stripe.Invoice & { subscription?: string | Stripe.Subscription | null }
         console.log('[WEBHOOK RECEIVED] invoice.paid', { invoiceId: invoice.id, subscription: invoice.subscription })
 
         const subscriptionId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id
@@ -181,8 +276,7 @@ export async function POST(request: Request) {
         }
 
         try {
-          const subscription = await stripe.subscriptions.retrieve(subscriptionId)
-          await upsertSubscriptionFromStripeSubscription(subscription)
+          await upsertSubscriptionFromStripeSubscription(subscriptionId)
           console.log('[HANDLED] invoice.paid', { invoiceId: invoice.id })
         } catch (err) {
           console.error('[INVOICE HANDLER FAILED]', err)
@@ -192,13 +286,13 @@ export async function POST(request: Request) {
       }
       case 'customer.subscription.created': {
         const subscription = event.data.object as Stripe.Subscription
-        await upsertSubscriptionFromStripeSubscription(subscription)
+        await upsertSubscriptionFromStripeSubscription(subscription.id)
         console.log('[HANDLED] customer.subscription.created', { stripeSubscriptionId: subscription.id })
         break
       }
       case 'customer.subscription.updated': {
         const subscription = event.data.object as Stripe.Subscription
-        await upsertSubscriptionFromStripeSubscription(subscription)
+        await upsertSubscriptionFromStripeSubscription(subscription.id)
         console.log('[HANDLED] customer.subscription.updated', { stripeSubscriptionId: subscription.id })
         break
       }

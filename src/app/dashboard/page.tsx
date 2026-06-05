@@ -1,5 +1,6 @@
 import { requireUser } from '@/src/lib/requireAuth'
 import prisma from '@/src/lib/prisma'
+import { getAdminOverviewData } from '@/src/lib/adminQueries'
 import SignOutButton from './signout-button'
 import SubscriptionCard from '@/src/components/dashboard/SubscriptionCard'
 import BillingPlans from '@/src/components/dashboard/BillingPlans'
@@ -34,8 +35,80 @@ const dashboardPlanDefinitions = [
 export default async function DashboardPage() {
   const session = await requireUser()
   const userId = session?.user?.id
+  const role = session?.user?.role ?? 'USER'
 
   console.log('[Dashboard] Page rendered for user:', { userId, email: session?.user?.email })
+  console.log('Session Role:', session.user.role)
+
+  if (role === 'ADMIN') {
+    const overview = await getAdminOverviewData()
+    return (
+      <div className="min-h-screen p-6 bg-sky-50">
+        <div className="max-w-6xl mx-auto space-y-6">
+          <div className="rounded-[2rem] bg-white p-8 shadow-sm">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h1 className="text-3xl font-semibold text-slate-950">Admin billing dashboard</h1>
+                <p className="mt-2 text-sm text-slate-600">Signed in as {session?.user?.email}</p>
+              </div>
+              <SignOutButton />
+            </div>
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-3">
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+              <p className="text-sm font-medium uppercase tracking-[0.15em] text-slate-500">Total Users</p>
+              <p className="mt-4 text-3xl font-semibold text-slate-950">{overview.totalUsers}</p>
+            </div>
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+              <p className="text-sm font-medium uppercase tracking-[0.15em] text-slate-500">Total Subscriptions</p>
+              <p className="mt-4 text-3xl font-semibold text-slate-950">{overview.totalSubscriptions}</p>
+            </div>
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+              <p className="text-sm font-medium uppercase tracking-[0.15em] text-slate-500">Active Subscriptions</p>
+              <p className="mt-4 text-3xl font-semibold text-slate-950">{overview.activeSubscriptions}</p>
+            </div>
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-2">
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+              <p className="text-sm font-medium uppercase tracking-[0.15em] text-slate-500">Monthly Revenue</p>
+              <p className="mt-4 text-3xl font-semibold text-slate-950">${overview.monthlyRevenue.toLocaleString()}</p>
+            </div>
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+              <p className="text-sm font-medium uppercase tracking-[0.15em] text-slate-500">Lifetime Revenue</p>
+              <p className="mt-4 text-3xl font-semibold text-slate-950">${overview.lifetimeRevenue.toLocaleString()}</p>
+            </div>
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-2">
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-950">Recent users</h2>
+              <div className="mt-4 space-y-3 text-sm text-slate-700">
+                {overview.recentUsers.map((user) => (
+                  <div key={user.id} className="rounded-2xl bg-slate-50 px-4 py-3">
+                    <p className="font-medium text-slate-900">{user.email}</p>
+                    <p className="text-slate-600">Joined {new Date(user.createdAt).toLocaleDateString()}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-950">Recent subscriptions</h2>
+              <div className="mt-4 space-y-3 text-sm text-slate-700">
+                {overview.recentSubscriptions.map((subscription) => (
+                  <div key={subscription.id} className="rounded-2xl bg-slate-50 px-4 py-3">
+                    <p className="font-medium text-slate-900">{subscription.stripePriceId}</p>
+                    <p className="text-slate-600">{subscription.status} • {new Date(subscription.currentPeriodEnd ?? subscription.createdAt).toLocaleDateString()}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   const activeSubscription = userId
     ? await prisma.subscription.findFirst({
