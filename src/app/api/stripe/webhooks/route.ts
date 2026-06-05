@@ -66,28 +66,55 @@ const upsertSubscriptionFromStripeSubscription = async (subscriptionOrId: Stripe
   console.log('[PLAN TYPE]', { planType })
   console.log('[STATUS]', { status: subscription.status })
 
-  const stripeSubscription = subscription as unknown as Stripe.Subscription & {
-    current_period_start?: number | null
-    current_period_end?: number | null
+  // DEBUG: Log raw Stripe subscription fields
+  // Cast to any to access Stripe API fields not exposed by TypeScript type definitions
+  const rawSubscription = subscription as any
+  console.log('[RAW STRIPE SUBSCRIPTION]', rawSubscription)
+  console.log('[RAW PERIOD START]', rawSubscription.current_period_start)
+  console.log('[RAW PERIOD END]', rawSubscription.current_period_end)
+  console.log('[RAW START DATE]', rawSubscription.start_date)
+  console.log('[RAW BILLING CYCLE ANCHOR]', rawSubscription.billing_cycle_anchor)
+  console.log('[RAW PERIOD START TYPE]', typeof rawSubscription.current_period_start)
+  console.log('[RAW PERIOD END TYPE]', typeof rawSubscription.current_period_end)
+
+  // Determine period start and end
+  // Priority: current_period_start (if present), then billing_cycle_anchor, then start_date
+  let periodStart: Date | null = null
+  let periodEnd: Date | null = null
+
+  if (rawSubscription.current_period_start) {
+    periodStart = new Date(rawSubscription.current_period_start * 1000)
+    console.log('[USING] current_period_start from Stripe')
+  } else if (rawSubscription.billing_cycle_anchor) {
+    periodStart = new Date(rawSubscription.billing_cycle_anchor * 1000)
+    console.log('[USING] billing_cycle_anchor as period start (current_period_start missing)')
+  } else if (rawSubscription.start_date) {
+    periodStart = new Date(rawSubscription.start_date * 1000)
+    console.log('[USING] start_date as period start (both current_period_start and billing_cycle_anchor missing)')
   }
 
-  const periodStart = stripeSubscription.current_period_start
-    ? new Date(stripeSubscription.current_period_start * 1000)
-    : null
-  const periodEnd = stripeSubscription.current_period_end
-    ? new Date(stripeSubscription.current_period_end * 1000)
-    : null
+  if (rawSubscription.current_period_end && periodStart) {
+    periodEnd = new Date(rawSubscription.current_period_end * 1000)
+    console.log('[USING] current_period_end from Stripe')
+  } else if (periodStart && billingInterval) {
+    // Calculate period end based on billing interval
+    const msPerDay = 24 * 60 * 60 * 1000
+    const msPerMonth = 30 * msPerDay
+    const msPerYear = 365 * msPerDay
 
-  console.log('[STRIPE PERIOD START]', { periodStart: stripeSubscription.current_period_start })
-  console.log('[STRIPE PERIOD END]', { periodEnd: stripeSubscription.current_period_end })
-  console.log('[DATABASE PERIOD START]', { periodStart })
-  console.log('[DATABASE PERIOD END]', { periodEnd })
+    const intervalMs = billingInterval === 'month' ? msPerMonth : billingInterval === 'year' ? msPerYear : msPerDay
+    periodEnd = new Date(periodStart.getTime() + intervalMs)
+    console.log('[CALCULATED] period_end from billing interval', { billingInterval, periodEnd })
+  }
 
-  if (!stripeSubscription.current_period_start || !stripeSubscription.current_period_end) {
+  console.log('[DATABASE PERIOD START (pre-upsert)]', { periodStart })
+  console.log('[DATABASE PERIOD END (pre-upsert)]', { periodEnd })
+
+  if (!rawSubscription.current_period_start || !rawSubscription.current_period_end) {
     console.warn('[STRIPE PERIOD MISSING]', {
       stripeSubscriptionId: subscription.id,
-      current_period_start: stripeSubscription.current_period_start,
-      current_period_end: stripeSubscription.current_period_end,
+      current_period_start: rawSubscription.current_period_start,
+      current_period_end: rawSubscription.current_period_end,
     })
   }
 
@@ -152,8 +179,19 @@ const upsertSubscriptionFromStripeSubscription = async (subscriptionOrId: Stripe
       },
     })
 
-    console.log('[DATABASE PERIOD START]', { databasePeriodStart: result.currentPeriodStart })
-    console.log('[DATABASE PERIOD END]', { databasePeriodEnd: result.currentPeriodEnd })
+    console.log('[DATABASE WRITE VALUES]', { assignedPeriodStart: periodStart, assignedPeriodEnd: periodEnd })
+    console.log('[DATABASE PERIOD START (post-upsert)]', { databasePeriodStart: result.currentPeriodStart })
+    console.log('[DATABASE PERIOD END (post-upsert)]', { databasePeriodEnd: result.currentPeriodEnd })
+
+    // Verify DB write by re-fetching
+    const verify = await prisma.subscription.findUnique({
+      where: { stripeSubscriptionId: subscription.id },
+    })
+    console.log('[DATABASE VERIFICATION (re-fetch)]', {
+      stripeSubscriptionId: verify?.stripeSubscriptionId,
+      currentPeriodStart: verify?.currentPeriodStart,
+      currentPeriodEnd: verify?.currentPeriodEnd,
+    })
 
     if (
       result.currentPeriodStart?.getTime() !== periodStart?.getTime() ||
